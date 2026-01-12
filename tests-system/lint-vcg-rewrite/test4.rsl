@@ -1,0 +1,16 @@
+package Test4
+
+type T {
+  value Integer
+}
+
+type Q {
+  a T
+  b T
+  c T
+}
+
+checks Q {
+  a != b and b != c, fatal "different references"
+  a.value < b.value, fatal "a < b"
+}

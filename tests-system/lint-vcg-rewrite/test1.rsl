@@ -1,0 +1,44 @@
+package Test_1
+
+enum ASIL {
+  QM
+  A
+  B
+  C
+  D
+}
+
+tuple Q {
+  first  Integer
+  second Integer
+}
+
+tuple S {
+  a Integer
+  separator :
+  b optional Integer
+  separator :
+  c optional Integer
+}
+
+type T {
+  asil              ASIL
+  opt_asil optional ASIL
+  int               Integer
+  opt_int  optional Integer
+  dec               Decimal
+  opt_dec  optional Decimal
+  str               String
+  opt_str  optional String
+  bool              Boolean
+  opt_bool optional Boolean
+  ref               T
+  opt_ref  optional T
+  arr               String [3 .. *]
+  opt_arr  optional String [3 .. *]
+  tup1              Q
+  opt_tup1 optional Q
+  tup2              S
+  opt_tup2 optional S
+  tup_arr           S [1 .. *]
+}

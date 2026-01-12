@@ -1,0 +1,24 @@
+package Test2
+
+type T {
+  x optional Integer
+}
+
+checks T {
+  x > 1, fatal "c1"
+}
+
+checks T {
+  x < 10, "c2"
+}
+
+checks T {
+  x != null, fatal "c3"
+}
+
+type Q extends T {
+}
+
+checks Q {
+  10 / x > 0, "baz"
+}

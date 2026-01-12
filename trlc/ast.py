@@ -2564,14 +2564,20 @@ class Composite_Type(Concrete_Type, metaclass=ABCMeta):
         assert isinstance(inherited_symbols, Symbol_Table) or \
             inherited_symbols is None
 
-        self.components  = Symbol_Table(inherited_symbols)
-        self.description = description
-        self.checks      = []
+        self.components   = Symbol_Table(inherited_symbols)
+        self.description  = description
+        self.checks       = []
+        self.check_blocks = []
 
     def add_check(self, n_check):
         # lobster-trace: LRM.Check_Evaluation_Order
         assert isinstance(n_check, Check)
         self.checks.append(n_check)
+
+    def add_check_block(self, n_check_block):
+        # lobster-trace: LRM.Check_Evaluation_Order
+        assert isinstance(n_check_block, Check_Block)
+        self.check_blocks.append(n_check_block)
 
     def iter_checks(self):
         # lobster-trace: LRM.Check_Evaluation_Order

@@ -1444,6 +1444,7 @@ class Parser(Parser_Base):
                                                  ast.Composite_Type)
         n_check_block = ast.Check_Block(location = self.ct.location,
                                         n_typ    = n_ctype)
+        n_ctype.add_check_block(n_check_block)
         n_check_block.set_ast_link(t_checks)
         n_ctype.set_ast_link(self.ct)
         scope = ast.Scope()

@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 #
 # TRLC - Treat Requirements Like Code
-# Copyright (C) 2023 Bayerische Motoren Werke Aktiengesellschaft (BMW AG)
-# Copyright (C) 2023-2025 Florian Schanda
+# Copyright (C) 2026 Florian Schanda
 #
 # This file is part of the TRLC Python Reference Implementation.
 #
@@ -21,24 +20,20 @@
 
 import subprocess
 
-from trlc.ast import *
-from trlc.errors import Location, Message_Handler
-
-try:
-    from pyvcg import smt
-    from pyvcg import graph
-    from pyvcg import vcg
-    from pyvcg.driver.file_smtlib import SMTLIB_Generator
-    from pyvcg.driver.cvc5_smtlib import CVC5_File_Solver
-    VCG_AVAILABLE = True
-except ImportError:  # pragma: no cover
-    VCG_AVAILABLE = False
+from pyvcg import smt
+from pyvcg import graph
+from pyvcg import vcg
+from pyvcg.driver.file_smtlib import SMTLIB_Generator
+from pyvcg.driver.cvc5_smtlib import CVC5_File_Solver
 
 try:
     from pyvcg.driver.cvc5_api import CVC5_Solver
     CVC5_API_AVAILABLE = True
 except ImportError:  # pragma: no cover
     CVC5_API_AVAILABLE = False
+
+from trlc import ast
+from trlc.errors import Location, Message_Handler
 
 CVC5_OPTIONS = {
     "tlimit-per"      : 2500,
@@ -50,22 +45,26 @@ CVC5_OPTIONS = {
 class Unsupported(Exception):  # pragma: no cover
     # lobster-exclude: Not safety relevant
     def __init__(self, node, text):
-        assert isinstance(node, Node)
+        assert isinstance(node, ast.Node)
         assert isinstance(text, str) or text is None
         super().__init__()
-        self.message  = "%s not yet supported in VCG" % \
-            (text if text else node.__class__.__name__)
+        self.message  = text
         self.location = node.location
 
 
 class Feedback:
+    KINDS = frozenset(["evaluation-of-null",
+                       "div-by-zero",
+                       "array-index",
+                       "always-true"])
+
     # lobster-exclude: Not safety relevant
-    def __init__(self, node, message, kind, expect_unsat=True):
-        assert isinstance(node, Expression)
+    def __init__(self, loc, message, kind, expect_unsat=True):
+        assert isinstance(loc, Location)
         assert isinstance(message, str)
-        assert isinstance(kind, str)
+        assert kind in Feedback.KINDS
         assert isinstance(expect_unsat, bool)
-        self.node         = node
+        self.loc          = loc
         self.message      = message
         self.kind         = "vcg-" + kind
         self.expect_unsat = expect_unsat
@@ -74,9 +73,8 @@ class Feedback:
 class VCG:
     # lobster-exclude: Not safety relevant
     def __init__(self, mh, n_ctyp, debug, use_api=True, cvc5_binary=None):
-        assert VCG_AVAILABLE
         assert isinstance(mh, Message_Handler)
-        assert isinstance(n_ctyp, Composite_Type)
+        assert isinstance(n_ctyp, ast.Composite_Type)
         assert isinstance(debug, bool)
         assert isinstance(use_api, bool)
         assert use_api or isinstance(cvc5_binary, str)
@@ -89,1452 +87,765 @@ class VCG:
 
         self.vc_name = "trlc-%s-%s" % (n_ctyp.n_package.name,
                                        n_ctyp.name)
-
         self.tmp_id = 0
 
-        self.vcg      = vcg.VCG()
-        self.graph    = self.vcg.graph
-        self.start    = self.vcg.start
-        # Current start node, we will update this as we go along.
-        self.preamble = None
+        self.vcg   = vcg.VCG()
+        self.graph = self.vcg.graph
+
+        self.gn_current = self.vcg.start
+        # Current node, we will update this as we go along.
+
+        self.preamble = self.vcg.start
         # We do remember the first node where we put all our
         # declarations, in case we need to add some more later.
 
-        self.constants    = {}
-        self.enumerations = {}
-        self.tuples       = {}
-        self.records      = {}
-        self.arrays       = {}
-        self.bound_vars   = {}
-        self.qe_vars      = {}
-        self.tuple_base   = {}
-        self.uf_records   = {}
+        self.s_this = None
+        # This will take a reference to the current "instance",
+        # i.e. a constant of the type we analyse
 
-        self.uf_matches   = None
-        # Pointer to the UF we use for matches. We only generate it
-        # when we must, as it may affect the logics selected due to
-        # string theory being used.
+        self.basic_sorts = {}
+        # Direct translations for non-builtin types
+        #   ast.Composite_Type   -> smt.Record
+        #   ast.Enumeration_Type -> smt.Enumeration
+        #   ast.Array_Type       -> smt.Sequence_Sort
 
-        self.functional   = False
-        # If set to true, then we ignore validity checks and do not
-        # create intermediates. We just build the value and validity
-        # expresions and return them.
+        self.component_sorts = {}
+        # Translations for record components (this is where the
+        # optional types live)
+        #   ast.Composite_Component -> smt.Optional
+        #   ast.Composite_Component -> <something from basic_sorts>
 
-        self.emit_checks  = True
-        # If set to false, we skip creating checks.
+        self.optional_sorts = {}
+        # To make sure we don't create duplicates we cache them here
+        #   smt.Sort -> smt.Optional
 
     @staticmethod
     def flag_unsupported(node, text=None):  # pragma: no cover
-        assert isinstance(node, Node)
+        assert isinstance(node, ast.Node)
         raise Unsupported(node, text)
 
     def new_temp_name(self):
         self.tmp_id += 1
         return "tmp.%u" % self.tmp_id
 
-    def get_uf_matches(self):
-        if self.uf_matches is None:
-            self.uf_matches = \
-                smt.Function("trlc.matches",
-                             smt.BUILTIN_BOOLEAN,
-                             smt.Bound_Variable(smt.BUILTIN_STRING,
-                                                "subject"),
-                             smt.Bound_Variable(smt.BUILTIN_STRING,
-                                                "regex"))
-
-            # Create UF for the matches function (for now, later we
-            # will deal with regex properly).
-            self.preamble.add_statement(
-                smt.Function_Declaration(self.uf_matches))
-
-        return self.uf_matches
-
-    def create_return(self, node, s_value, s_valid=None):
-        assert isinstance(node, Expression)
-        assert isinstance(s_value, smt.Expression)
-        assert isinstance(s_valid, smt.Expression) or s_valid is None
-
-        if s_valid is None:
-            s_valid = smt.Boolean_Literal(True)
-
-        if self.functional:
-            return s_value, s_valid
-
-        else:
-            sym_result = smt.Constant(s_value.sort,
-                                      self.new_temp_name())
-            self.attach_temp_declaration(node, sym_result, s_value)
-
-            return sym_result, s_valid
-
-    def attach_validity_check(self, bool_expr, origin):
-        assert isinstance(bool_expr, smt.Expression)
-        assert bool_expr.sort is smt.BUILTIN_BOOLEAN
-        assert isinstance(origin, Expression)
-        assert not self.functional
-
-        if not self.emit_checks:
-            return
-
-        # Attach new graph node advance start
-        if not bool_expr.is_static_true():
-            gn_check = graph.Check(self.graph)
-            gn_check.add_goal(bool_expr,
-                              Feedback(origin,
-                                       "expression could be null",
-                                       "evaluation-of-null"),
-                              "validity check for %s" % origin.to_string())
-            self.start.add_edge_to(gn_check)
-            self.start = gn_check
-
-    def attach_int_division_check(self, int_expr, origin):
-        assert isinstance(int_expr, smt.Expression)
-        assert int_expr.sort is smt.BUILTIN_INTEGER
-        assert isinstance(origin, Expression)
-        assert not self.functional
-
-        if not self.emit_checks:
-            return
-
-        # Attach new graph node advance start
-        gn_check = graph.Check(self.graph)
-        gn_check.add_goal(
-            smt.Boolean_Negation(
-                smt.Comparison("=", int_expr, smt.Integer_Literal(0))),
-            Feedback(origin,
-                     "divisor could be 0",
-                     "div-by-zero"),
-            "division by zero check for %s" % origin.to_string())
-        self.start.add_edge_to(gn_check)
-        self.start = gn_check
-
-    def attach_real_division_check(self, real_expr, origin):
-        assert isinstance(real_expr, smt.Expression)
-        assert real_expr.sort is smt.BUILTIN_REAL
-        assert isinstance(origin, Expression)
-        assert not self.functional
-
-        if not self.emit_checks:
-            return
-
-        # Attach new graph node advance start
-        gn_check = graph.Check(self.graph)
-        gn_check.add_goal(
-            smt.Boolean_Negation(
-                smt.Comparison("=", real_expr, smt.Real_Literal(0))),
-            Feedback(origin,
-                     "divisor could be 0.0",
-                     "div-by-zero"),
-            "division by zero check for %s" % origin.to_string())
-        self.start.add_edge_to(gn_check)
-        self.start = gn_check
-
-    def attach_index_check(self, seq_expr, index_expr, origin):
-        assert isinstance(seq_expr, smt.Expression)
-        assert isinstance(seq_expr.sort, smt.Sequence_Sort)
-        assert isinstance(index_expr, smt.Expression)
-        assert index_expr.sort is smt.BUILTIN_INTEGER
-        assert isinstance(origin, Binary_Expression)
-        assert origin.operator == Binary_Operator.INDEX
-        assert not self.functional
-
-        if not self.emit_checks:
-            return
-
-        # Attach new graph node advance start
-        gn_check = graph.Check(self.graph)
-        gn_check.add_goal(
-            smt.Comparison(">=", index_expr, smt.Integer_Literal(0)),
-            Feedback(origin,
-                     "array index could be less than 0",
-                     "array-index"),
-            "index lower bound check for %s" % origin.to_string())
-        gn_check.add_goal(
-            smt.Comparison("<",
-                           index_expr,
-                           smt.Sequence_Length(seq_expr)),
-            Feedback(origin,
-                     "array index could be larger than len(%s)" %
-                     origin.n_lhs.to_string(),
-                     "array-index"),
-            "index lower bound check for %s" % origin.to_string())
-
-        self.start.add_edge_to(gn_check)
-        self.start = gn_check
-
-    def attach_feasability_check(self, bool_expr, origin):
-        assert isinstance(bool_expr, smt.Expression)
-        assert bool_expr.sort is smt.BUILTIN_BOOLEAN
-        assert isinstance(origin, Expression)
-        assert not self.functional
-
-        if not self.emit_checks:
-            return
-
-        # Attach new graph node advance start
-        gn_check = graph.Check(self.graph)
-        gn_check.add_goal(bool_expr,
-                          Feedback(origin,
-                                   "expression is always true",
-                                   "always-true",
-                                   expect_unsat = False),
-                          "feasability check for %s" % origin.to_string())
-        self.start.add_edge_to(gn_check)
-
-    def attach_assumption(self, bool_expr):
-        assert isinstance(bool_expr, smt.Expression)
-        assert bool_expr.sort is smt.BUILTIN_BOOLEAN
-        assert not self.functional
-
-        # Attach new graph node advance start
-        gn_ass = graph.Assumption(self.graph)
-        gn_ass.add_statement(smt.Assertion(bool_expr))
-        self.start.add_edge_to(gn_ass)
-        self.start = gn_ass
-
-    def attach_temp_declaration(self, node, sym, value=None):
-        assert isinstance(node, (Expression, Action))
-        assert isinstance(sym, smt.Constant)
-        assert isinstance(value, smt.Expression) or value is None
-        assert not self.functional
-
-        # Attach new graph node advance start
-        gn_decl = graph.Assumption(self.graph)
-        gn_decl.add_statement(
-            smt.Constant_Declaration(
-                symbol   = sym,
-                value    = value,
-                comment  = "result of %s at %s" % (node.to_string(),
-                                                   node.location.to_string()),
-                relevant = False))
-        self.start.add_edge_to(gn_decl)
-        self.start = gn_decl
-
-    def attach_empty_assumption(self):
-        assert not self.functional
-
-        # Attach new graph node advance start
-        gn_decl = graph.Assumption(self.graph)
-        self.start.add_edge_to(gn_decl)
-        self.start = gn_decl
-
-    def analyze(self):
+    def analyse(self):
         try:
-            self.checks_on_composite_type(self.n_ctyp)
+            self.analyse_composite_type(self.n_ctyp)
         except Unsupported as exc:  # pragma: no cover
             self.mh.warning(exc.location,
-                            exc.message)
+                            "currently unsupported in VCG (%s)" % exc.message)
 
-    def checks_on_composite_type(self, n_ctyp):
-        assert isinstance(n_ctyp, Composite_Type)
+    def analyse_composite_type(self, n_ctyp):
+        assert isinstance(n_ctyp, ast.Composite_Type)
 
-        # Create node for global declarations
-        gn_locals = graph.Assumption(self.graph)
-        self.start.add_edge_to(gn_locals)
-        self.start    = gn_locals
-        self.preamble = gn_locals
+        # Create variable(s)
+        s_sort = self.tr_type(n_typ            = n_ctyp,
+                              indirect_records = False)
+        self.s_this = smt.Constant(sort = s_sort,
+                                   name = "this")
+        self.preamble.add_statement(
+            smt.Constant_Declaration(symbol   = self.s_this,
+                                     relevant = True))
 
-        # Create local variables
-        for n_component in n_ctyp.all_components():
-            self.tr_component_decl(n_component, self.start)
+        # Add constraints
+        self.assert_type_constraints(s_expr           = self.s_this,
+                                     n_typ            = n_ctyp,
+                                     indirect_records = False)
+        if self.debug:
+            subprocess.run(["dot",
+                            "-Tpdf",
+                            "-o%s-types.pdf" % self.vc_name],
+                           input=self.graph.debug_render_dot(),
+                           check=True,
+                           encoding="UTF-8")
 
-        # Create paths for checks
-        for n_check in n_ctyp.iter_checks():
-            current_start = self.start
-            self.tr_check(n_check)
+        # Traverse checks and create graph
+        self.build_graph()
+        if self.debug:
+            subprocess.run(["dot",
+                            "-Tpdf",
+                            "-o%s-graph.pdf" % self.vc_name],
+                           input=self.graph.debug_render_dot(),
+                           check=True,
+                           encoding="UTF-8")
 
-            # Only fatal checks contribute to the total knowledge
-            if n_check.severity != "fatal":
-                self.start = current_start
-
-        # Emit debug graph
-        if self.debug:  # pragma: no cover
-            subprocess.run(["dot", "-Tpdf", "-o%s.pdf" % self.vc_name],
-                           input = self.graph.debug_render_dot(),
-                           check = True,
-                           encoding = "UTF-8")
-
-        # Generate VCs
+        # Generate VCs + Solve
         self.vcg.generate()
-
-        # Solve VCs and provide feedback
-        nok_feasibility_checks = []
-        ok_feasibility_checks  = set()
-        nok_validity_checks    = set()
-
         for vc_id, vc in enumerate(self.vcg.vcs):
             if self.debug:  # pramga: no cover
                 with open(self.vc_name + "_%04u.smt2" % vc_id, "w",
                           encoding="UTF-8") as fd:
                     fd.write(vc["script"].generate_vc(SMTLIB_Generator()))
 
-            # Checks that have already failed don't need to be checked
-            # again on a different path
-            if vc["feedback"].expect_unsat and \
-               vc["feedback"] in nok_validity_checks:
-                continue
+    ######################################################################
+    # Types -> SMTLIB Sorts
+    ######################################################################
 
-            if self.use_api:
-                solver = CVC5_Solver()
-            else:
-                solver = CVC5_File_Solver(self.cvc5_bin)
-            for name, value in CVC5_OPTIONS.items():
-                solver.set_solver_option(name, value)
+    def tr_type(self, n_typ, indirect_records=True):
+        # Translate a Type into an SMTLIB sort
+        assert isinstance(n_typ, ast.Type)
+        assert isinstance(indirect_records, bool)
 
-            status, values = vc["script"].solve_vc(solver)
-
-            message = vc["feedback"].message
-            if self.debug:  # pragma: no cover
-                message += " [vc_id = %u]" % vc_id
-
-            if vc["feedback"].expect_unsat:
-                if status != "unsat":
-                    self.mh.check(vc["feedback"].node.location,
-                                  message,
-                                  vc["feedback"].kind,
-                                  self.create_counterexample(status,
-                                                             values))
-                    nok_validity_checks.add(vc["feedback"])
-            else:
-                if status == "unsat":
-                    nok_feasibility_checks.append(vc["feedback"])
-                else:
-                    ok_feasibility_checks.add(vc["feedback"])
-
-        # This is a bit wonky, but this way we make sure the ording is
-        # consistent
-        for feedback in nok_feasibility_checks:
-            if feedback not in ok_feasibility_checks:
-                self.mh.check(feedback.node.location,
-                              feedback.message,
-                              feedback.kind)
-                ok_feasibility_checks.add(feedback)
-
-    def create_counterexample(self, status, values):
-        rv = [
-            "example %s triggering error:" %
-            self.n_ctyp.__class__.__name__.lower(),
-            "  %s bad_potato {" % self.n_ctyp.name
-        ]
-
-        for n_component in self.n_ctyp.all_components():
-            id_value = self.tr_component_value_name(n_component)
-            id_valid = self.tr_component_valid_name(n_component)
-            if status == "unknown" and (id_value not in values or
-                                        id_valid not in values):
-                rv.append("    %s = ???" % n_component.name)
-            elif values.get(id_valid):
-                rv.append("    %s = %s" %
-                          (n_component.name,
-                           self.value_to_trlc(n_component.n_typ,
-                                              values[id_value])))
-            else:
-                rv.append("    /* %s is null */" % n_component.name)
-
-        rv.append("  }")
-        if status == "unknown":
-            rv.append("/* note: counter-example is unreliable in this case */")
-        return "\n".join(rv)
-
-    def fraction_to_decimal_string(self, num, den):
-        assert isinstance(num, int)
-        assert isinstance(den, int) and den >= 1
-
-        tmp = den
-        if tmp > 2:
-            while tmp > 1:
-                if tmp % 2 == 0:
-                    tmp = tmp // 2
-                elif tmp % 5 == 0:
-                    tmp = tmp // 5
-                else:
-                    return "%i / %u" % (num, den)
-
-        rv = str(abs(num) // den)
-
-        i = abs(num) % den
-        j = den
-
-        if i > 0:
-            rv += "."
-            while i > 0:
-                i *= 10
-                rv += str(i // j)
-                i = i % j
-        else:
-            rv += ".0"
-
-        if num < 0:
-            return "-" + rv
-        else:
-            return rv
-
-    def value_to_trlc(self, n_typ, value):
-        assert isinstance(n_typ, Type)
-
-        if isinstance(n_typ, Builtin_Integer):
-            return str(value)
-
-        elif isinstance(n_typ, Builtin_Decimal):
-            if isinstance(value, Fraction):
-                num, den = value.as_integer_ratio()
-                if den >= 1:
-                    return self.fraction_to_decimal_string(num, den)
-                else:
-                    return self.fraction_to_decimal_string(-num, -den)
-            else:
-                return "/* unable to generate precise value */"
-
-        elif isinstance(n_typ, Builtin_Boolean):
-            return "true" if value else "false"
-
-        elif isinstance(n_typ, Enumeration_Type):
-            return n_typ.name + "." + value
-
-        elif isinstance(n_typ, Builtin_String):
-            if "\n" in value:
-                return "'''%s'''" % value
-            else:
-                return '"%s"' % value
-
-        elif isinstance(n_typ, Record_Type):
-            if value < 0:
-                instance_id = value * -2 - 1
-            else:
-                instance_id = value * 2
-            if n_typ.n_package is self.n_ctyp.n_package:
-                return "%s_instance_%i" % (n_typ.name, instance_id)
-            else:
-                return "%s.%s_instance_%i" % (n_typ.n_package.name,
-                                              n_typ.name,
-                                              instance_id)
-
-        elif isinstance(n_typ, Tuple_Type):
-            parts = []
-            for n_item in n_typ.iter_sequence():
-                if isinstance(n_item, Composite_Component):
-                    if n_item.optional and not value[n_item.name + ".valid"]:
-                        parts.pop()
-                        break
-                    parts.append(
-                        self.value_to_trlc(n_item.n_typ,
-                                           value[n_item.name + ".value"]))
-
-                else:
-                    assert isinstance(n_item, Separator)
-                    sep_text = {
-                        "AT"        : "@",
-                        "COLON"     : ":",
-                        "SEMICOLON" : ";"
-                    }.get(n_item.token.kind, n_item.token.value)
-                    parts.append(sep_text)
-
-            if n_typ.has_separators():
-                return "".join(parts)
-            else:
-                return "(%s)" % ", ".join(parts)
-
-        elif isinstance(n_typ, Array_Type):
-            return "[%s]" % ", ".join(self.value_to_trlc(n_typ.element_type,
-                                                         item)
-                                      for item in value)
-
-        else:  # pragma: no cover
-            self.flag_unsupported(n_typ,
-                                  "back-conversion from %s" % n_typ.name)
-
-    def tr_component_value_name(self, n_component):
-        return n_component.member_of.fully_qualified_name() + \
-            "." + n_component.name + ".value"
-
-    def tr_component_valid_name(self, n_component):
-        return n_component.member_of.fully_qualified_name() + \
-            "." + n_component.name + ".valid"
-
-    def emit_tuple_constraints(self, n_tuple, s_sym):
-        assert isinstance(n_tuple, Tuple_Type)
-        assert isinstance(s_sym, smt.Constant)
-
-        old_functional, self.functional = self.functional, True
-        self.tuple_base[n_tuple] = s_sym
-
-        constraints = []
-
-        # The first tuple constraint is that all checks must have
-        # passed, otherwise the tool would just error. An error in a
-        # tuple is pretty much the same as a fatal in the enclosing
-        # record.
-
-        for n_check in n_tuple.iter_checks():
-            if n_check.severity == "warning":
-                continue
-            # We do consider both fatal and errors to be sources of
-            # truth here.
-            c_value, _ = self.tr_expression(n_check.n_expr)
-            constraints.append(c_value)
-
-        # The secopnd tuple constraint is that once you get a null
-        # field, all following fields must also be null.
-
-        components = n_tuple.all_components()
-        for i, component in enumerate(components):
-            if component.optional:
-                condition = smt.Boolean_Negation(
-                    smt.Record_Access(s_sym,
-                                      component.name + ".valid"))
-                consequences = [
-                    smt.Boolean_Negation(
-                        smt.Record_Access(s_sym,
-                                          c.name + ".valid"))
-                    for c in components[i + 1:]
-                ]
-                if len(consequences) == 0:
-                    break
-                elif len(consequences) == 1:
-                    consequence = consequences[0]
-                else:
-                    consequence = smt.Conjunction(*consequences)
-                constraints.append(smt.Implication(condition, consequence))
-
-        del self.tuple_base[n_tuple]
-        self.functional = old_functional
-
-        for cons in constraints:
-            self.start.add_statement(smt.Assertion(cons))
-
-    def tr_component_decl(self, n_component, gn_locals):
-        assert isinstance(n_component, Composite_Component)
-        assert isinstance(gn_locals, graph.Assumption)
-
-        if isinstance(self.n_ctyp, Record_Type):
-            frozen = self.n_ctyp.is_frozen(n_component)
-        else:
-            frozen = False
-
-        id_value = self.tr_component_value_name(n_component)
-        s_sort = self.tr_type(n_component.n_typ)
-        s_sym  = smt.Constant(s_sort, id_value)
-        if frozen:
-            old_functional, self.functional = self.functional, True
-            s_val, _ = self.tr_expression(
-                self.n_ctyp.get_freezing_expression(n_component))
-            self.functional = old_functional
-        else:
-            s_val = None
-        s_decl = smt.Constant_Declaration(
-            symbol   = s_sym,
-            value    = s_val,
-            comment  = "value for %s declared on %s" % (
-                n_component.name,
-                n_component.location.to_string()),
-            relevant = True)
-        gn_locals.add_statement(s_decl)
-        self.constants[id_value] = s_sym
-
-        if isinstance(n_component.n_typ, Tuple_Type):
-            self.emit_tuple_constraints(n_component.n_typ, s_sym)
-
-        # For arrays we need to add additional constraints for the
-        # length
-        if isinstance(n_component.n_typ, Array_Type):
-            if n_component.n_typ.lower_bound > 0:
-                s_lower = smt.Integer_Literal(n_component.n_typ.lower_bound)
-                gn_locals.add_statement(
-                    smt.Assertion(
-                        smt.Comparison(">=",
-                                       smt.Sequence_Length(s_sym),
-                                       s_lower)))
-
-            if n_component.n_typ.upper_bound is not None:
-                s_upper = smt.Integer_Literal(n_component.n_typ.upper_bound)
-                gn_locals.add_statement(
-                    smt.Assertion(
-                        smt.Comparison("<=",
-                                       smt.Sequence_Length(s_sym),
-                                       s_upper)))
-
-        id_valid = self.tr_component_valid_name(n_component)
-        s_sym  = smt.Constant(smt.BUILTIN_BOOLEAN, id_valid)
-        s_val  = (None
-                  if n_component.optional and not frozen
-                  else smt.Boolean_Literal(True))
-        s_decl = smt.Constant_Declaration(
-            symbol   = s_sym,
-            value    = s_val,
-            relevant = True)
-        gn_locals.add_statement(s_decl)
-        self.constants[id_valid] = s_sym
-
-    def tr_type(self, n_type):
-        assert isinstance(n_type, Type)
-
-        if isinstance(n_type, Builtin_Boolean):
-            return smt.BUILTIN_BOOLEAN
-
-        elif isinstance(n_type, Builtin_Integer):
+        if isinstance(n_typ, ast.Record_Type) and indirect_records:
+            # Record references are translated differently. We treat
+            # them as integers, and we will later use an uninterpreted
+            # function to retrieve an instance.
             return smt.BUILTIN_INTEGER
-
-        elif isinstance(n_type, Builtin_Decimal):
-            return smt.BUILTIN_REAL
-
-        elif isinstance(n_type, Builtin_String):
+        elif isinstance(n_typ, ast.Composite_Type):
+            return self.tr_type_composite(n_typ)
+        elif isinstance(n_typ, ast.Enumeration_Type):
+            return self.tr_type_enumeration(n_typ)
+        elif isinstance(n_typ, ast.Array_Type):
+            return self.tr_type_array(n_typ)
+        elif isinstance(n_typ, ast.Builtin_String):
             return smt.BUILTIN_STRING
-
-        elif isinstance(n_type, Enumeration_Type):
-            if n_type not in self.enumerations:
-                s_sort = smt.Enumeration(n_type.n_package.name +
-                                         "." + n_type.name)
-                for n_lit in n_type.literals.values():
-                    s_sort.add_literal(n_lit.name)
-                self.enumerations[n_type] = s_sort
-                self.start.add_statement(
-                    smt.Enumeration_Declaration(
-                        s_sort,
-                        "enumeration %s from %s" % (
-                            n_type.name,
-                            n_type.location.to_string())))
-            return self.enumerations[n_type]
-
-        elif isinstance(n_type, Tuple_Type):
-            if n_type not in self.tuples:
-                s_sort = smt.Record(n_type.n_package.name +
-                                    "." + n_type.name)
-                for n_component in n_type.all_components():
-                    s_sort.add_component(n_component.name + ".value",
-                                         self.tr_type(n_component.n_typ))
-                    if n_component.optional:
-                        s_sort.add_component(n_component.name + ".valid",
-                                             smt.BUILTIN_BOOLEAN)
-                self.tuples[n_type] = s_sort
-                self.start.add_statement(
-                    smt.Record_Declaration(
-                        s_sort,
-                        "tuple %s from %s" % (
-                            n_type.name,
-                            n_type.location.to_string())))
-
-            return self.tuples[n_type]
-
-        elif isinstance(n_type, Array_Type):
-            if n_type not in self.arrays:
-                s_element_sort = self.tr_type(n_type.element_type)
-                s_sequence = smt.Sequence_Sort(s_element_sort)
-                self.arrays[n_type] = s_sequence
-
-            return self.arrays[n_type]
-
-        elif isinstance(n_type, Record_Type):
-            # Record references are modelled as a free integer. If we
-            # access their field then we use an uninterpreted
-            # function. Some of these have special meaning:
-            #   0             - the null reference
-            #   1             - the self reference
-            #   anything else - uninterpreted
+        elif isinstance(n_typ, ast.Builtin_Integer):
             return smt.BUILTIN_INTEGER
-
-        else:  # pragma: no cover
-            self.flag_unsupported(n_type)
-
-    def tr_check(self, n_check):
-        assert isinstance(n_check, Check)
-
-        # If the check belongs to a different type then we are looking
-        # at a type extension. In this case we do not create checks
-        # again, because if a check would fail it would already have
-        # failed.
-        if n_check.n_type is not self.n_ctyp:
-            old_emit, self.emit_checks = self.emit_checks, False
-
-        value, valid = self.tr_expression(n_check.n_expr)
-        self.attach_validity_check(valid, n_check.n_expr)
-        self.attach_feasability_check(value, n_check.n_expr)
-        self.attach_assumption(value)
-
-        if n_check.n_type is not self.n_ctyp:
-            self.emit_checks = old_emit
-
-    def tr_expression(self, n_expr):
-        value = None
-
-        if isinstance(n_expr, Name_Reference):
-            return self.tr_name_reference(n_expr)
-
-        elif isinstance(n_expr, Unary_Expression):
-            return self.tr_unary_expression(n_expr)
-
-        elif isinstance(n_expr, Binary_Expression):
-            return self.tr_binary_expression(n_expr)
-
-        elif isinstance(n_expr, Range_Test):
-            return self.tr_range_test(n_expr)
-
-        elif isinstance(n_expr, OneOf_Expression):
-            return self.tr_oneof_test(n_expr)
-
-        elif isinstance(n_expr, Conditional_Expression):
-            if self.functional:
-                return self.tr_conditional_expression_functional(n_expr)
-            else:
-                return self.tr_conditional_expression(n_expr)
-
-        elif isinstance(n_expr, Null_Literal):
-            return None, smt.Boolean_Literal(False)
-
-        elif isinstance(n_expr, Boolean_Literal):
-            value = smt.Boolean_Literal(n_expr.value)
-
-        elif isinstance(n_expr, Integer_Literal):
-            value = smt.Integer_Literal(n_expr.value)
-
-        elif isinstance(n_expr, Decimal_Literal):
-            value = smt.Real_Literal(n_expr.value)
-
-        elif isinstance(n_expr, Enumeration_Literal):
-            value = smt.Enumeration_Literal(self.tr_type(n_expr.typ),
-                                            n_expr.value.name)
-
-        elif isinstance(n_expr, String_Literal):
-            value = smt.String_Literal(n_expr.value)
-
-        elif isinstance(n_expr, Quantified_Expression):
-            return self.tr_quantified_expression(n_expr)
-
-        elif isinstance(n_expr, Field_Access_Expression):
-            return self.tr_field_access_expression(n_expr)
-
-        else:  # pragma: no cover
-            self.flag_unsupported(n_expr)
-
-        return value, smt.Boolean_Literal(True)
-
-    def tr_name_reference(self, n_ref):
-        assert isinstance(n_ref, Name_Reference)
-
-        if isinstance(n_ref.entity, Composite_Component):
-            if n_ref.entity.member_of in self.tuple_base:
-                sym = self.tuple_base[n_ref.entity.member_of]
-                if n_ref.entity.optional:
-                    s_valid = smt.Record_Access(sym,
-                                                n_ref.entity.name + ".valid")
-                else:
-                    s_valid = smt.Boolean_Literal(True)
-                s_value = smt.Record_Access(sym,
-                                            n_ref.entity.name + ".value")
-                return s_value, s_valid
-
-            else:
-                id_value = self.tr_component_value_name(n_ref.entity)
-                id_valid = self.tr_component_valid_name(n_ref.entity)
-                return self.constants[id_value], self.constants[id_valid]
-
+        elif isinstance(n_typ, ast.Builtin_Decimal):
+            return smt.BUILTIN_REAL
+        elif isinstance(n_typ, ast.Builtin_Boolean):
+            return smt.BUILTIN_BOOLEAN
         else:
-            assert isinstance(n_ref.entity, Quantified_Variable)
-            if n_ref.entity in self.qe_vars:
-                return self.qe_vars[n_ref.entity], smt.Boolean_Literal(True)
-            else:
-                return self.bound_vars[n_ref.entity], smt.Boolean_Literal(True)
+            self.flag_unsupported(
+                n_typ,
+                "translation of %s is not supported yet" %
+                n_typ.__class__.__name__)
+            return None
 
-    def tr_unary_expression(self, n_expr):
-        assert isinstance(n_expr, Unary_Expression)
+    def tr_type_composite(self, n_typ):
+        # Translate a tuple or record type
+        assert isinstance(n_typ, ast.Composite_Type)
+        if n_typ in self.basic_sorts:
+            return self.basic_sorts[n_typ]
 
-        operand_value, operand_valid = self.tr_expression(n_expr.n_operand)
-        if not self.functional:
-            self.attach_validity_check(operand_valid, n_expr.n_operand)
+        s_sort = smt.Record(n_typ.name)
+        for n_component in n_typ.components.values():
+            s_sort.add_component(
+                name = n_component.name,
+                sort = self.tr_type_of_composite_component(n_component))
 
-        sym_value = None
+        self.preamble.add_statement(smt.Record_Declaration(s_sort))
+        self.basic_sorts[n_typ] = s_sort
+        return s_sort
 
-        if n_expr.operator == Unary_Operator.MINUS:
-            if isinstance(n_expr.n_operand.typ, Builtin_Integer):
-                sym_value = smt.Unary_Int_Arithmetic_Op("-",
-                                                        operand_value)
-            else:
-                assert isinstance(n_expr.n_operand.typ, Builtin_Decimal)
-                sym_value = smt.Unary_Real_Arithmetic_Op("-",
-                                                         operand_value)
+    def tr_type_of_composite_component(self, n_component):
+        # Translate the type of a component (optional or regular)
+        assert isinstance(n_component, ast.Composite_Component)
+        if n_component in self.component_sorts:
+            return self.component_sorts[n_component]
 
-        elif n_expr.operator == Unary_Operator.PLUS:
-            sym_value = operand_value
-
-        elif n_expr.operator == Unary_Operator.LOGICAL_NOT:
-            sym_value = smt.Boolean_Negation(operand_value)
-
-        elif n_expr.operator == Unary_Operator.ABSOLUTE_VALUE:
-            if isinstance(n_expr.n_operand.typ, Builtin_Integer):
-                sym_value = smt.Unary_Int_Arithmetic_Op("abs",
-                                                        operand_value)
-
-            else:
-                assert isinstance(n_expr.n_operand.typ, Builtin_Decimal)
-                sym_value = smt.Unary_Real_Arithmetic_Op("abs",
-                                                         operand_value)
-
-        elif n_expr.operator == Unary_Operator.STRING_LENGTH:
-            sym_value = smt.String_Length(operand_value)
-
-        elif n_expr.operator == Unary_Operator.ARRAY_LENGTH:
-            sym_value = smt.Sequence_Length(operand_value)
-
-        elif n_expr.operator == Unary_Operator.CONVERSION_TO_DECIMAL:
-            sym_value = smt.Conversion_To_Real(operand_value)
-
-        elif n_expr.operator == Unary_Operator.CONVERSION_TO_INT:
-            sym_value = smt.Conversion_To_Integer("rna", operand_value)
-
+        if n_component.optional:
+            s_sort = self.tr_type_optional(n_component.n_typ)
         else:
-            self.mh.ice_loc(n_expr,
-                            "unexpected unary operator %s" %
-                            n_expr.operator.name)
+            s_sort = self.tr_type(n_component.n_typ)
 
-        return self.create_return(n_expr, sym_value)
+        self.component_sorts[n_component] = s_sort
+        return s_sort
 
-    def tr_binary_expression(self, n_expr):
-        assert isinstance(n_expr, Binary_Expression)
+    def tr_type_optional(self, n_typ):
+        # Translate a given type as its optional version
+        assert isinstance(n_typ, ast.Type)
 
-        # Some operators deal with validity in a different way. We
-        # deal with them first and then exit.
-        if n_expr.operator in (Binary_Operator.COMP_EQ,
-                               Binary_Operator.COMP_NEQ):
-            return self.tr_op_equality(n_expr)
+        s_base_sort = self.tr_type(n_typ)
+        if s_base_sort in self.optional_sorts:
+            return self.optional_sorts[s_base_sort]
 
-        elif n_expr.operator == Binary_Operator.LOGICAL_IMPLIES:
-            return self.tr_op_implication(n_expr)
+        s_sort = smt.Optional(s_base_sort)
+        self.preamble.add_statement(smt.Optional_Declaration(s_sort))
+        self.optional_sorts[s_base_sort] = s_sort
+        return s_sort
 
-        elif n_expr.operator == Binary_Operator.LOGICAL_AND:
-            return self.tr_op_and(n_expr)
+    def tr_type_enumeration(self, n_typ):
+        # Translate the given enum type
+        assert isinstance(n_typ, ast.Enumeration_Type)
+        if n_typ in self.basic_sorts:
+            return self.basic_sorts[n_typ]
 
-        elif n_expr.operator == Binary_Operator.LOGICAL_OR:
-            return self.tr_op_or(n_expr)
+        s_sort = smt.Enumeration(n_typ.name)
+        for n_literal_spec in n_typ.literals.values():
+            assert isinstance(n_literal_spec, ast.Enumeration_Literal_Spec)
+            s_sort.add_literal(n_literal_spec.name)
 
-        # The remaining operators always check for validity, so we can
-        # obtain the values of both sides now.
-        lhs_value, lhs_valid = self.tr_expression(n_expr.n_lhs)
-        if not self.functional:
-            self.attach_validity_check(lhs_valid, n_expr.n_lhs)
-        rhs_value, rhs_valid = self.tr_expression(n_expr.n_rhs)
-        if not self.functional:
-            self.attach_validity_check(rhs_valid, n_expr.n_rhs)
-        sym_value = None
+        self.preamble.add_statement(smt.Enumeration_Declaration(s_sort))
+        self.basic_sorts[n_typ] = s_sort
+        return s_sort
 
-        if n_expr.operator == Binary_Operator.LOGICAL_XOR:
-            sym_value = smt.Exclusive_Disjunction(lhs_value, rhs_value)
+    def tr_type_array(self, n_typ):
+        # Translate the given array type. Note that any constraints
+        # (e.g. on length) will be added later, they are not part of
+        # the sort.
+        assert isinstance(n_typ, ast.Array_Type)
+        if n_typ in self.basic_sorts:
+            return self.basic_sorts[n_typ]
 
-        elif n_expr.operator in (Binary_Operator.PLUS,
-                                 Binary_Operator.MINUS,
-                                 Binary_Operator.TIMES,
-                                 Binary_Operator.DIVIDE,
-                                 Binary_Operator.REMAINDER):
+        s_element_sort = self.tr_type(n_typ.element_type)
+        s_sort = smt.Sequence_Sort(s_element_sort)
 
-            if isinstance(n_expr.n_lhs.typ, Builtin_String):
-                assert n_expr.operator == Binary_Operator.PLUS
-                sym_value = smt.String_Concatenation(lhs_value, rhs_value)
+        # No declaration for this as it's a parametric builtin type
+        self.basic_sorts[n_typ] = s_sort
+        return s_sort
 
-            elif isinstance(n_expr.n_lhs.typ, Builtin_Integer):
-                if n_expr.operator in (Binary_Operator.DIVIDE,
-                                       Binary_Operator.REMAINDER):
-                    self.attach_int_division_check(rhs_value, n_expr)
+    ######################################################################
+    # Types constraints
+    ######################################################################
 
-                smt_op = {
-                    Binary_Operator.PLUS      : "+",
-                    Binary_Operator.MINUS     : "-",
-                    Binary_Operator.TIMES     : "*",
-                    Binary_Operator.DIVIDE    : "floor_div",
-                    Binary_Operator.REMAINDER : "ada_remainder",
-                }[n_expr.operator]
+    def assert_type_constraints(self, s_expr, n_typ, indirect_records=True):
+        # Assert on the given expression that all type constraints are
+        # met.
+        assert isinstance(s_expr, smt.Expression)
+        assert isinstance(n_typ, ast.Type)
+        assert isinstance(indirect_records, bool)
+        assert self.tr_type(n_typ, indirect_records) is s_expr.sort
 
-                sym_value = smt.Binary_Int_Arithmetic_Op(smt_op,
-                                                         lhs_value,
-                                                         rhs_value)
+        s_constraints = self.build_type_constraints(s_expr,
+                                                    n_typ,
+                                                    indirect_records)
 
+        if s_constraints.is_static_true():
+            return
+
+        # This is not necessary but it makes VCs a bit more readable.
+        if isinstance(s_constraints, smt.Conjunction):
+            for term in s_constraints.terms:
+                self.gn_current.add_statement(smt.Assertion(term))
+        else:
+            self.gn_current.add_statement(smt.Assertion(s_constraints))
+
+    def build_type_constraints(self, s_expr, n_typ, indirect_records=True):
+        # Create a boolean expression involving the given expression
+        # that captures all type constraints of the given type.
+        assert isinstance(s_expr, smt.Expression)
+        assert isinstance(n_typ, ast.Type)
+        assert isinstance(indirect_records, bool)
+        assert self.tr_type(n_typ, indirect_records) is s_expr.sort
+
+        if isinstance(n_typ, ast.Record_Type) and indirect_records:
+            # TODO. Need to apply the UF and apply constraints on the
+            # result
+            return smt.Boolean_Literal(True)
+        elif isinstance(n_typ, ast.Composite_Type):
+            return self.build_type_constraints_composite(s_expr,
+                                                         n_typ)
+        elif isinstance(n_typ, ast.Array_Type):
+            return self.build_type_constraints_array(s_expr, n_typ)
+        elif isinstance(n_typ, (ast.Enumeration_Type,
+                                ast.Builtin_String,
+                                ast.Builtin_Integer,
+                                ast.Builtin_Decimal,
+                                ast.Builtin_Boolean)):
+            return smt.Boolean_Literal(True)
+        else:
+            self.flag_unsupported(
+                n_typ,
+                "type constraints for %s are not supported yet" %
+                n_typ.__class__.__name__)
+            return None
+
+    def build_type_constraints_composite(self, s_expr, n_typ):
+        assert isinstance(s_expr, smt.Expression)
+        assert isinstance(n_typ, ast.Composite_Type)
+        assert self.tr_type(n_typ, indirect_records=False) is s_expr.sort
+
+        terms = []
+
+        # Classic field-specific constraints
+        for n_component in n_typ.components.values():
+            s_field = smt.Record_Access(record    = s_expr,
+                                        component = n_component.name)
+
+            if n_component.optional:
+                s_value = smt.Optional_Value(s_field)
             else:
-                assert isinstance(n_expr.n_lhs.typ, Builtin_Decimal)
-                if n_expr.operator == Binary_Operator.DIVIDE:
-                    self.attach_real_division_check(rhs_value, n_expr)
+                s_value = s_field
+            s_constraint = self.build_type_constraints(
+                s_expr = s_value,
+                n_typ  = n_component.n_typ)
 
-                smt_op = {
-                    Binary_Operator.PLUS   : "+",
-                    Binary_Operator.MINUS  : "-",
-                    Binary_Operator.TIMES  : "*",
-                    Binary_Operator.DIVIDE : "/",
-                }[n_expr.operator]
+            if s_constraint.is_static_true():
+                # If the constraint itself is always true, then we can
+                # just skip the component since X -> true is always
+                # true.
+                continue
 
-                sym_value = smt.Binary_Real_Arithmetic_Op(smt_op,
-                                                          lhs_value,
-                                                          rhs_value)
-
-        elif n_expr.operator in (Binary_Operator.COMP_LT,
-                                 Binary_Operator.COMP_LEQ,
-                                 Binary_Operator.COMP_GT,
-                                 Binary_Operator.COMP_GEQ):
-            smt_op = {
-                Binary_Operator.COMP_LT  : "<",
-                Binary_Operator.COMP_LEQ : "<=",
-                Binary_Operator.COMP_GT  : ">",
-                Binary_Operator.COMP_GEQ : ">=",
-            }[n_expr.operator]
-
-            sym_value = smt.Comparison(smt_op, lhs_value, rhs_value)
-
-        elif n_expr.operator in (Binary_Operator.STRING_CONTAINS,
-                                 Binary_Operator.STRING_STARTSWITH,
-                                 Binary_Operator.STRING_ENDSWITH):
-
-            smt_op = {
-                Binary_Operator.STRING_CONTAINS   : "contains",
-                Binary_Operator.STRING_STARTSWITH : "prefixof",
-                Binary_Operator.STRING_ENDSWITH   : "suffixof"
-            }
-
-            # LHS / RHS ordering is not a mistake, in SMTLIB it's the
-            # other way around than in TRLC.
-            sym_value = smt.String_Predicate(smt_op[n_expr.operator],
-                                             rhs_value,
-                                             lhs_value)
-
-        elif n_expr.operator == Binary_Operator.STRING_REGEX:
-            rhs_evaluation = n_expr.n_rhs.evaluate(self.mh, None, None).value
-            assert isinstance(rhs_evaluation, str)
-
-            sym_value = smt.Function_Application(
-                self.get_uf_matches(),
-                lhs_value,
-                smt.String_Literal(rhs_evaluation))
-
-        elif n_expr.operator == Binary_Operator.INDEX:
-            self.attach_index_check(lhs_value, rhs_value, n_expr)
-            sym_value = smt.Sequence_Index(lhs_value, rhs_value)
-
-        elif n_expr.operator == Binary_Operator.ARRAY_CONTAINS:
-            sym_value = smt.Sequence_Contains(rhs_value, lhs_value)
-
-        elif n_expr.operator == Binary_Operator.POWER:
-            # LRM says that the exponent is always static and an
-            # integer
-            static_value = n_expr.n_rhs.evaluate(self.mh, None, None).value
-            assert isinstance(static_value, int) and static_value >= 0
-
-            if static_value == 0:
-                if isinstance(n_expr.n_lhs.typ, Builtin_Integer):
-                    sym_value = smt.Integer_Literal(1)
-                else:
-                    assert isinstance(n_expr.n_lhs.typ, Builtin_Decimal)
-                    sym_value = smt.Real_Literal(1)
-
+            if n_component.optional:
+                s_term = smt.Implication(
+                    smt.Boolean_Negation(smt.Optional_Null_Check(s_field)),
+                    s_constraint)
             else:
-                sym_value = lhs_value
-                for _ in range(1, static_value):
-                    if isinstance(n_expr.n_lhs.typ, Builtin_Integer):
-                        sym_value = smt.Binary_Int_Arithmetic_Op("*",
-                                                                 sym_value,
-                                                                 lhs_value)
-                    else:
-                        assert isinstance(n_expr.n_lhs.typ, Builtin_Decimal)
-                        sym_value = smt.Binary_Real_Arithmetic_Op("*",
-                                                                  sym_value,
-                                                                  lhs_value)
-
-        else:  # pragma: no cover
-            self.flag_unsupported(n_expr, n_expr.operator.name)
-
-        return self.create_return(n_expr, sym_value)
-
-    def tr_range_test(self, n_expr):
-        assert isinstance(n_expr, Range_Test)
-
-        lhs_value, lhs_valid     = self.tr_expression(n_expr.n_lhs)
-        self.attach_validity_check(lhs_valid, n_expr.n_lhs)
-        lower_value, lower_valid = self.tr_expression(n_expr.n_lower)
-        self.attach_validity_check(lower_valid, n_expr.n_lower)
-        upper_value, upper_valid = self.tr_expression(n_expr.n_upper)
-        self.attach_validity_check(upper_valid, n_expr.n_upper)
-
-        sym_value = smt.Conjunction(
-            smt.Comparison(">=", lhs_value, lower_value),
-            smt.Comparison("<=", lhs_value, upper_value))
-
-        return self.create_return(n_expr, sym_value)
-
-    def tr_oneof_test(self, n_expr):
-        assert isinstance(n_expr, OneOf_Expression)
-
-        choices = []
-        for n_choice in n_expr.choices:
-            c_value, c_valid = self.tr_expression(n_choice)
-            self.attach_validity_check(c_valid, n_choice)
-            choices.append(c_value)
-
-        negated_choices = [smt.Boolean_Negation(c)
-                           for c in choices]
-
-        # pylint: disable=consider-using-enumerate
-
-        if len(choices) == 1:
-            result = choices[0]
-        elif len(choices) == 2:
-            result = smt.Exclusive_Disjunction(choices[0], choices[1])
-        else:
-            assert len(choices) >= 3
-            values = []
-            for choice_id in range(len(choices)):
-                sequence = []
-                for other_id in range(len(choices)):
-                    if other_id == choice_id:
-                        sequence.append(choices[other_id])
-                    else:
-                        sequence.append(negated_choices[other_id])
-                values.append(smt.Conjunction(*sequence))
-            result = smt.Disjunction(*values)
-
-        return self.create_return(n_expr, result)
-
-    def tr_conditional_expression_functional(self, n_expr):
-        assert isinstance(n_expr, Conditional_Expression)
-
-        s_result, _ = self.tr_expression(n_expr.else_expr)
-        for n_action in reversed(n_expr.actions):
-            s_condition, _ = self.tr_expression(n_action.n_cond)
-            s_true, _      = self.tr_expression(n_action.n_expr)
-            s_result = smt.Conditional(s_condition, s_true, s_result)
-
-        return self.create_return(n_expr, s_result)
-
-    def tr_conditional_expression(self, n_expr):
-        assert isinstance(n_expr, Conditional_Expression)
-        assert not self.functional
-
-        gn_end = graph.Node(self.graph)
-        sym_result = smt.Constant(self.tr_type(n_expr.typ),
-                                  self.new_temp_name())
-
-        for n_action in n_expr.actions:
-            test_value, test_valid = self.tr_expression(n_action.n_cond)
-            self.attach_validity_check(test_valid, n_action.n_cond)
-            current_start = self.start
-
-            # Create path where action is true
-            self.attach_assumption(test_value)
-            res_value, res_valid = self.tr_expression(n_action.n_expr)
-            self.attach_validity_check(res_valid, n_action.n_expr)
-            self.attach_temp_declaration(n_action,
-                                         sym_result,
-                                         res_value)
-            self.start.add_edge_to(gn_end)
-
-            # Reset to test and proceed with the other actions
-            self.start = current_start
-            self.attach_assumption(smt.Boolean_Negation(test_value))
-
-        # Finally execute the else part
-        res_value, res_valid = self.tr_expression(n_expr.else_expr)
-        self.attach_validity_check(res_valid, n_expr.else_expr)
-        self.attach_temp_declaration(n_expr,
-                                     sym_result,
-                                     res_value)
-        self.start.add_edge_to(gn_end)
-
-        # And join
-        self.start = gn_end
-        return sym_result, smt.Boolean_Literal(True)
-
-    def tr_op_implication(self, n_expr):
-        assert isinstance(n_expr, Binary_Expression)
-        assert n_expr.operator == Binary_Operator.LOGICAL_IMPLIES
-
-        if self.functional:
-            lhs_value, _ = self.tr_expression(n_expr.n_lhs)
-            rhs_value, _ = self.tr_expression(n_expr.n_rhs)
-            return self.create_return(n_expr,
-                                      smt.Implication(lhs_value, rhs_value))
-
-        lhs_value, lhs_valid = self.tr_expression(n_expr.n_lhs)
-        # Emit VC for validity
-        self.attach_validity_check(lhs_valid, n_expr.n_lhs)
-
-        # Split into two paths.
-        current_start = self.start
-        sym_result = smt.Constant(smt.BUILTIN_BOOLEAN,
-                                  self.new_temp_name())
-        gn_end = graph.Node(self.graph)
-
-        ### 1: Implication is not valid
-        self.start = current_start
-        self.attach_assumption(smt.Boolean_Negation(lhs_value))
-        self.attach_temp_declaration(n_expr,
-                                     sym_result,
-                                     smt.Boolean_Literal(True))
-        self.start.add_edge_to(gn_end)
-
-        ### 2: Implication is valid.
-        self.start = current_start
-        self.attach_assumption(lhs_value)
-        rhs_value, rhs_valid = self.tr_expression(n_expr.n_rhs)
-        self.attach_validity_check(rhs_valid, n_expr.n_rhs)
-        self.attach_temp_declaration(n_expr,
-                                     sym_result,
-                                     rhs_value)
-        self.start.add_edge_to(gn_end)
-
-        # Join paths
-        self.start = gn_end
-
-        return sym_result, smt.Boolean_Literal(True)
-
-    def tr_op_and(self, n_expr):
-        assert isinstance(n_expr, Binary_Expression)
-        assert n_expr.operator == Binary_Operator.LOGICAL_AND
-
-        if self.functional:
-            lhs_value, _ = self.tr_expression(n_expr.n_lhs)
-            rhs_value, _ = self.tr_expression(n_expr.n_rhs)
-            return self.create_return(n_expr,
-                                      smt.Conjunction(lhs_value, rhs_value))
-
-        lhs_value, lhs_valid = self.tr_expression(n_expr.n_lhs)
-        # Emit VC for validity
-        self.attach_validity_check(lhs_valid, n_expr.n_lhs)
-
-        # Split into two paths.
-        current_start = self.start
-        sym_result = smt.Constant(smt.BUILTIN_BOOLEAN,
-                                  self.new_temp_name())
-        gn_end = graph.Node(self.graph)
-
-        ### 1: LHS is not true
-        self.start = current_start
-        self.attach_assumption(smt.Boolean_Negation(lhs_value))
-        self.attach_temp_declaration(n_expr,
-                                     sym_result,
-                                     smt.Boolean_Literal(False))
-        self.start.add_edge_to(gn_end)
-
-        ### 2: LHS is true
-        self.start = current_start
-        self.attach_assumption(lhs_value)
-        rhs_value, rhs_valid = self.tr_expression(n_expr.n_rhs)
-        self.attach_validity_check(rhs_valid, n_expr.n_rhs)
-        self.attach_temp_declaration(n_expr,
-                                     sym_result,
-                                     rhs_value)
-        self.start.add_edge_to(gn_end)
-
-        # Join paths
-        self.start = gn_end
-
-        return sym_result, smt.Boolean_Literal(True)
-
-    def tr_op_or(self, n_expr):
-        assert isinstance(n_expr, Binary_Expression)
-        assert n_expr.operator == Binary_Operator.LOGICAL_OR
-
-        if self.functional:
-            lhs_value, _ = self.tr_expression(n_expr.n_lhs)
-            rhs_value, _ = self.tr_expression(n_expr.n_rhs)
-            return self.create_return(n_expr,
-                                      smt.Disjunction(lhs_value, rhs_value))
-
-        lhs_value, lhs_valid = self.tr_expression(n_expr.n_lhs)
-        # Emit VC for validity
-        self.attach_validity_check(lhs_valid, n_expr.n_lhs)
-
-        # Split into two paths.
-        current_start = self.start
-        sym_result = smt.Constant(smt.BUILTIN_BOOLEAN,
-                                  self.new_temp_name())
-        gn_end = graph.Node(self.graph)
-
-        ### 1: LHS is true
-        self.start = current_start
-        self.attach_assumption(lhs_value)
-        self.attach_temp_declaration(n_expr,
-                                     sym_result,
-                                     smt.Boolean_Literal(True))
-        self.start.add_edge_to(gn_end)
-
-        ### 2: LHS is not true
-        self.start = current_start
-        self.attach_assumption(smt.Boolean_Negation(lhs_value))
-        rhs_value, rhs_valid = self.tr_expression(n_expr.n_rhs)
-        self.attach_validity_check(rhs_valid, n_expr.n_rhs)
-        self.attach_temp_declaration(n_expr,
-                                     sym_result,
-                                     rhs_value)
-        self.start.add_edge_to(gn_end)
-
-        # Join paths
-        self.start = gn_end
-
-        return sym_result, smt.Boolean_Literal(True)
-
-    def tr_core_equality_tuple_component(self, n_component, lhs, rhs):
-        assert isinstance(n_component, Composite_Component)
-        assert isinstance(lhs, smt.Expression)
-        assert isinstance(rhs, smt.Expression)
-
-        value_lhs = smt.Record_Access(lhs,
-                                      n_component.name + ".value")
-        value_rhs = smt.Record_Access(rhs,
-                                      n_component.name + ".value")
-        valid_equal = self.tr_core_equality(n_component.n_typ,
-                                            value_lhs,
-                                            value_rhs)
-
-        if not n_component.optional:
-            return valid_equal
-
-        valid_lhs = smt.Record_Access(lhs,
-                                      n_component.name + ".valid")
-        valid_rhs = smt.Record_Access(rhs,
-                                      n_component.name + ".valid")
-
-        return smt.Conjunction(
-            smt.Comparison("=", valid_lhs, valid_rhs),
-            smt.Implication(valid_lhs, valid_equal))
-
-    def tr_core_equality(self, n_typ, lhs, rhs):
-        assert isinstance(n_typ, Type)
-        assert isinstance(lhs, smt.Expression)
-        assert isinstance(rhs, smt.Expression)
-
-        if isinstance(n_typ, Tuple_Type):
-            parts = []
-            for n_component in n_typ.all_components():
-                parts.append(
-                    self.tr_core_equality_tuple_component(n_component,
-                                                          lhs,
-                                                          rhs))
-
-            if len(parts) == 0:
-                return smt.Boolean_Literal(True)
-            elif len(parts) == 1:
-                return parts[0]
-            else:
-                result = smt.Conjunction(parts[0], parts[1])
-                for part in parts[2:]:
-                    result = smt.Conjunction(result, part)
-                return result
-
-        else:
-            return smt.Comparison("=", lhs, rhs)
-
-    def tr_op_equality(self, n_expr):
-        assert isinstance(n_expr, Binary_Expression)
-        assert n_expr.operator in (Binary_Operator.COMP_EQ,
-                                   Binary_Operator.COMP_NEQ)
-
-        lhs_value, lhs_valid = self.tr_expression(n_expr.n_lhs)
-        rhs_value, rhs_valid = self.tr_expression(n_expr.n_rhs)
-
-        if lhs_value is None:
-            comp_typ = n_expr.n_rhs.typ
-        else:
-            comp_typ = n_expr.n_lhs.typ
-
-        if lhs_valid.is_static_true() and rhs_valid.is_static_true():
-            # Simplified form, this is just x == y
-            result = self.tr_core_equality(comp_typ,
-                                           lhs_value,
-                                           rhs_value)
-
-        elif lhs_valid.is_static_false() and rhs_valid.is_static_false():
-            # This is null == null, so true
-            result = smt.Boolean_Literal(True)
-
-        elif lhs_value is None:
-            # This is null == <expr>, true iff rhs is null
-            result = smt.Boolean_Negation(rhs_valid)
-
-        elif rhs_value is None:
-            # This is <expr> == null, true iff lhs is null
-            result = smt.Boolean_Negation(lhs_valid)
-
-        else:
-            # This is <expr> == <expr> without shortcuts
-            result = smt.Conjunction(
-                smt.Comparison("=", lhs_valid, rhs_valid),
-                smt.Implication(lhs_valid,
-                                self.tr_core_equality(comp_typ,
-                                                      lhs_value,
-                                                      rhs_value)))
-
-        if n_expr.operator == Binary_Operator.COMP_NEQ:
-            result = smt.Boolean_Negation(result)
-
-        return self.create_return(n_expr, result)
-
-    def tr_quantified_expression(self, n_expr):
-        assert isinstance(n_expr, Quantified_Expression)
-
-        # Nested quantifiers are not supported yet
-        if self.functional:  # pragma: no cover
-            self.flag_unsupported(n_expr,
-                                  "functional evaluation of quantifier")
-
-        # TRLC quantifier
-        #   (forall x in arr_name => body)
-        #
-        # SMT quantifier
-        #   (forall ((i Int))
-        #     (=> (and (>= i 0) (< i (seq.len arr_name)))
-        #         (... (seq.nth arr_name i) ... )))
-        #
-        # There is an alternative which is:
-        #   (forall ((element ElementSort))
-        #     (=> (seq.contains arr_name (seq.unit element))
-        #         (... element ...)
-        #
-        # However it looks like for CVC5 at least this generates more
-        # unknown and less unsat if a check depends on the explicit
-        # value of some sequence member.
-
-        # Evaluate subject first and creat a null check
-        s_subject_value, s_subject_valid = \
-            self.tr_name_reference(n_expr.n_source)
-        self.attach_validity_check(s_subject_valid, n_expr.n_source)
-
-        # Create validity checks for the body. We do this by creating
-        # a new branch and eliminating the quantifier; pretending it's
-        # a forall (since we want to show that for all evaluations
-        # it's valid).
-        current_start = self.start
-        self.attach_empty_assumption()
-        src_typ = n_expr.n_source.typ
-        assert isinstance(src_typ, Array_Type)
-        s_qe_index = smt.Constant(smt.BUILTIN_INTEGER,
-                                  self.new_temp_name())
-        self.start.add_statement(
-            smt.Constant_Declaration(
-                symbol   = s_qe_index,
-                comment  = ("quantifier elimination (index) for %s at %s" %
-                            (n_expr.to_string(),
-                             n_expr.location.to_string()))))
-        self.start.add_statement(
-            smt.Assertion(smt.Comparison(">=",
-                                         s_qe_index,
-                                         smt.Integer_Literal(0))))
-        self.start.add_statement(
-            smt.Assertion(
+                s_term = s_constraint
+
+            terms.append(s_term)
+
+        # Tuples (with optional fields) have one more property we need
+        # to take care of.
+        # lobster-trace: LRM.Tuple_Separator_Form
+        # Specifically once we get a null field, the rest are also
+        # null.
+        if isinstance(n_typ, ast.Tuple_Type) and n_typ.has_separators():
+            s_prev = None
+            for n_component in n_typ.components.values():
+                if n_component.optional:
+                    s_field = smt.Record_Access(record    = s_expr,
+                                                component = n_component.name)
+                    if s_prev is not None:
+                        s_term = smt.Implication(
+                            smt.Optional_Null_Check(s_prev),
+                            smt.Optional_Null_Check(s_field))
+                        terms.append(s_term)
+                    s_prev = s_field
+
+        # TODO: assume successful checks for tuple types
+        # TODO: assume successful pre-reference checks for records
+
+        return self.simplify_conjunction(terms)
+
+    def build_type_constraints_array(self, s_expr, n_typ):
+        assert isinstance(s_expr, smt.Expression)
+        assert isinstance(n_typ, ast.Array_Type)
+        assert self.tr_type(n_typ) is s_expr.sort
+
+        terms = []
+
+        # Constraint for minimum size (if any)
+        if n_typ.lower_bound > 0:
+            terms.append(
+                smt.Comparison(">=",
+                               smt.Sequence_Length(s_expr),
+                               smt.Integer_Literal(n_typ.lower_bound)))
+
+        # Constraint for maximum size (if any)
+        if n_typ.upper_bound is not None:
+            terms.append(
+                smt.Comparison("<=",
+                               smt.Sequence_Length(s_expr),
+                               smt.Integer_Literal(n_typ.upper_bound)))
+
+        # Type constraints for all elements
+        s_bound_var = smt.Bound_Variable(sort = smt.BUILTIN_INTEGER,
+                                         name = self.new_temp_name())
+        s_value = smt.Sequence_Index(sequence = s_expr,
+                                     index    = s_bound_var)
+        s_predicate = self.build_type_constraints(s_expr = s_value,
+                                                  n_typ  = n_typ.element_type)
+        if not s_predicate.is_static_true():
+            s_guard = smt.Conjunction(
+                smt.Comparison(">=",
+                               s_bound_var,
+                               smt.Integer_Literal(0)),
                 smt.Comparison("<",
-                               s_qe_index,
-                               smt.Sequence_Length(s_subject_value))))
-        s_qe_sym = smt.Constant(self.tr_type(src_typ.element_type),
-                                self.new_temp_name())
-        self.start.add_statement(
-            smt.Constant_Declaration(
-                symbol   = s_qe_sym,
-                value    = smt.Sequence_Index(s_subject_value, s_qe_index),
-                comment  = ("quantifier elimination (symbol) for %s at %s" %
-                            (n_expr.to_string(),
-                             n_expr.location.to_string()))))
-        self.qe_vars[n_expr.n_var] = s_qe_sym
+                               s_bound_var,
+                               smt.Sequence_Length(s_expr)))
+            s_body = smt.Implication(s_guard, s_predicate)
+            terms.append(
+                smt.Quantifier(kind      = "forall",
+                               variables = [s_bound_var],
+                               body      = s_body))
 
-        _, b_valid = self.tr_expression(n_expr.n_expr)
-        self.attach_validity_check(b_valid, n_expr.n_expr)
+        return self.simplify_conjunction(terms)
 
-        self.start = current_start
-        del self.qe_vars[n_expr.n_var]
+    ######################################################################
+    # VCG
+    ######################################################################
 
-        # We have now shown that any path in the quantifier cannot
-        # raise exception. Asserting the actual value of the
-        # quantifier is more awkward.
+    def build_graph(self):
+        # Build graph from which we generate VCs. Some important
+        # notes:
+        #
+        # lobster-trace: LRM.Check_Evaluation_Order
+        # Inside a check block, we get the obvious order.
+        #
+        # lobster-trace: LRM.Check_Evaluation_Order_Across_Blocks
+        # If the user has multiple check blocks they need to be
+        # evaluated "in parallel", i.e. we cannot rely on fatal
+        # messages from one to guarantee properties
+        #
+        # lobster-trace: LRM.Check_Evaluation_Order_For_Extensions
+        # That said, for type extensions we can assume all parent
+        # checks have been evaluated (in any order) before we get to
+        # ours, so we can assume fatal checks.
+        check_groups = self.build_check_groups(self.n_ctyp)
 
-        s_q_idx = smt.Bound_Variable(smt.BUILTIN_INTEGER,
-                                     self.new_temp_name())
-        s_q_sym = smt.Sequence_Index(s_subject_value, s_q_idx)
-        self.bound_vars[n_expr.n_var] = s_q_sym
+        # First we assert all fatal checks from extended types as
+        # background knowledge. We can do it in any order.
+        for check_group in check_groups["established"]:
+            assert isinstance(check_group, list)
+            for n_check_block in check_group:
+                assert isinstance(n_check_block, ast.Check_Block)
+                self.build_check_block(n_block     = n_check_block,
+                                       with_checks = False)
 
-        temp, self.functional = self.functional, True
-        b_value, _ = self.tr_expression(n_expr.n_expr)
-        self.functional = temp
+        # Then we check the current type's check blocks (independent
+        # of ordering).
+        gn_start = self.gn_current
+        for n_check_block in check_groups["new"]:
+            assert isinstance(n_check_block, ast.Check_Block)
+            self.gn_current = gn_start
+            self.build_check_block(n_block     = n_check_block,
+                                   with_checks = True)
 
-        bounds_expr = smt.Conjunction(
-            smt.Comparison(">=",
-                           s_q_idx,
-                           smt.Integer_Literal(0)),
-            smt.Comparison("<",
-                           s_q_idx,
-                           smt.Sequence_Length(s_subject_value)))
-        if n_expr.universal:
-            value = smt.Quantifier(
-                "forall",
-                [s_q_idx],
-                smt.Implication(bounds_expr, b_value))
+    def build_check_groups(self, n_typ):
+        # Create sets of checks that must be evaluated together
+        # lobster-trace: LRM.Check_Evaluation_Order_Across_Blocks
+        # lobster-trace: LRM.Check_Evaluation_Order_For_Extensions
+        assert isinstance(n_typ, ast.Composite_Type)
+
+        check_groups = {
+            "established" : [],
+            "new"         : n_typ.check_blocks
+        }
+        if isinstance(n_typ, ast.Record_Type):
+            n_ptr = n_typ.parent
+            while n_ptr is not None:
+                if n_ptr.check_blocks:
+                    check_groups["established"].insert(0, n_ptr.check_blocks)
+                n_ptr = n_ptr.parent
+        elif isinstance(n_typ, ast.Tuple_Type):
+            pass
         else:
-            value = smt.Quantifier(
-                "exists",
-                [s_q_idx],
-                smt.Conjunction(bounds_expr, b_value))
+            self.flag_unsupported(n_typ,
+                                  "unexpected composite type %s" %
+                                  n_typ.__class__.__name__)
 
-        return value, smt.Boolean_Literal(True)
+        return check_groups
 
-    def tr_field_access_expression(self, n_expr):
-        assert isinstance(n_expr, Field_Access_Expression)
+    def build_check_block(self, n_block, with_checks):
+        # Create checks in the graph for this block. Ensures that
+        # self.gn_current will end up a single node that flows out of
+        # all paths from this check block.
+        assert isinstance(n_block, ast.Check_Block)
+        assert isinstance(with_checks, bool)
 
-        if self.functional:  # pragma: no cover
+        gn_start = self.gn_current
+        for n_check in n_block.checks:
+            if n_check.severity in ("warning", "error"):
+                # For non-fatal checks we simply reset the current
+                # node so that our path is a dead-end (since no future
+                # check can rely on it). If we don't do checks we can
+                # also totally ignore them, because they do not
+                # terminate execution.
+                if with_checks:
+                    self.build_check(n_check, with_checks)
+                    self.gn_current = gn_start
+            elif n_check.severity == "fatal":
+                # For fatal checks we adjust gn_start so subsequent
+                # checks can rely on the properties asserted by the
+                # check
+                self.build_check(n_check, with_checks)
+                gn_start = self.gn_current
+            else:
+                self.flag_unsupported(n_check,
+                                      "unexpected severity %s" %
+                                      n_check.severity)
+
+    def build_check(self, n_check, with_checks):
+        assert isinstance(n_check, ast.Check)
+        assert isinstance(with_checks, bool)
+
+        s_expr = self.build_expression(n_expr      = n_check.n_expr,
+                                       with_checks = with_checks)
+
+        gn = graph.Assumption(self.graph)
+        gn.add_statement(smt.Assertion(s_expr))
+        self.gn_current.add_edge_to(gn)
+        self.gn_current = gn
+
+    ######################################################################
+    # Checks
+    ######################################################################
+
+    def check_not_null(self, loc, s_expr):
+        assert isinstance(loc, Location)
+        assert isinstance(s_expr, smt.Expression)
+
+        s_goal = self.mk_is_not_null(s_expr)
+
+        gn_check = graph.Check(self.graph)
+        gn_check.add_goal(
+            expression = s_goal,
+            feedback   = Feedback(loc     = loc,
+                                  message = "might be null",
+                                  kind    = "evaluation-of-null"),
+            comment    = "null check at %s" % loc.to_string())
+        self.gn_current.add_edge_to(gn_check)
+
+        self.gn_current = gn_check
+
+    def check_div_by_zero(self, loc, s_expr):
+        assert isinstance(loc, Location)
+        assert isinstance(s_expr, smt.Expression)
+
+        s_goal = smt.Boolean_Negation(
+            smt.Comparison("=",
+                           s_expr,
+                           smt.Integer_Literal(0)))
+
+        gn_check = graph.Check(self.graph)
+        gn_check.add_goal(
+            expression = s_goal,
+            feedback   = Feedback(loc     = loc,
+                                  message = "potential division by zero",
+                                  kind    = "div-by-zero"),
+            comment    = "division by zero check at %s" % loc.to_string())
+        self.gn_current.add_edge_to(gn_check)
+
+        self.gn_current = gn_check
+
+    ######################################################################
+    # Expressions
+    ######################################################################
+
+    def build_expression(self, n_expr, with_checks, permit_null=False):
+        assert isinstance(n_expr, ast.Expression)
+        assert isinstance(with_checks, bool)
+        assert isinstance(permit_null, bool)
+
+        if False:
+            pass
+        elif isinstance(n_expr, ast.Binary_Expression):
+            s_rv = self.build_expression_binary(n_expr, with_checks)
+        elif isinstance(n_expr, ast.Integer_Literal):
+            s_rv = smt.Integer_Literal(n_expr.value)
+        elif isinstance(n_expr, ast.Name_Reference):
+            s_rv = self.build_expression_name_reference(n_expr)
+        else:
             self.flag_unsupported(n_expr,
-                                  "functional evaluation of field access")
+                                  "unexpected expression type %s" %
+                                  n_expr.__class__.__name__)
 
-        prefix_value, prefix_valid = self.tr_expression(n_expr.n_prefix)
-        prefix_typ = n_expr.n_prefix.typ
-        self.attach_validity_check(prefix_valid, n_expr.n_prefix)
+        if with_checks and not permit_null and n_expr.can_be_null():
+            self.check_not_null(n_expr.location, s_rv)
 
-        if isinstance(prefix_typ, Tuple_Type):
-            field_value = smt.Record_Access(prefix_value,
-                                            n_expr.n_field.name + ".value")
-            if n_expr.n_field.optional:
-                field_valid = smt.Record_Access(prefix_value,
-                                                n_expr.n_field.name + ".valid")
+        return s_rv
+
+    def build_expression_binary(self, n_expr, with_checks):
+        # Build expression for all binary expressions
+        assert isinstance(n_expr, ast.Binary_Expression)
+        assert isinstance(with_checks, bool)
+
+        smt_int_op = {ast.Binary_Operator.PLUS   : "+",
+                      ast.Binary_Operator.MINUS  : "-",
+                      ast.Binary_Operator.TIMES  : "*",
+                      ast.Binary_Operator.DIVIDE : "floor_div"}
+        smt_dec_op = {ast.Binary_Operator.PLUS   : "+",
+                      ast.Binary_Operator.MINUS  : "-",
+                      ast.Binary_Operator.TIMES  : "*",
+                      ast.Binary_Operator.DIVIDE : "/"}
+
+        # Equality is extra weird, so we deal with it first
+        if n_expr.operator in (ast.Binary_Operator.COMP_EQ,
+                               ast.Binary_Operator.COMP_NEQ):
+            return self.build_expression_equality(n_expr, with_checks)
+
+        # Secondly, some binary operators (and, or, implies) have
+        # short-cut semantics. For them we need to deal with the
+        # branch.
+        if n_expr.operator in (ast.Binary_Operator.LOGICAL_AND,
+                               ast.Binary_Operator.LOGICAL_OR,
+                               ast.Binary_Operator.LOGICAL_IMPLIES):
+            return self.build_expression_shortcut(n_expr, with_checks)
+
+        # Otherwise, we have something normal, and so we need to check
+        # for null.
+        s_lhs = self.mk_value(self.build_expression(n_expr.n_lhs, with_checks))
+        s_rhs = self.mk_value(self.build_expression(n_expr.n_rhs, with_checks))
+
+
+        if n_expr.operator in (ast.Binary_Operator.COMP_EQ,
+                               ast.Binary_Operator.COMP_NEQ):
+            self.mh.ice_loc(n_expr, "impossible")
+        elif n_expr.operator == ast.Binary_Operator.COMP_LT:
+            return smt.Comparison("<", s_lhs, s_rhs)
+        elif n_expr.operator == ast.Binary_Operator.COMP_GT:
+            return smt.Comparison(">", s_lhs, s_rhs)
+        elif n_expr.operator == ast.Binary_Operator.COMP_LEQ:
+            return smt.Comparison("<=", s_lhs, s_rhs)
+        elif n_expr.operator == ast.Binary_Operator.COMP_GEQ:
+            return smt.Comparison(">=", s_lhs, s_rhs)
+        elif n_expr.operator in (ast.Binary_Operator.PLUS,
+                                 ast.Binary_Operator.MINUS,
+                                 ast.Binary_Operator.TIMES,
+                                 ast.Binary_Operator.DIVIDE):
+            if with_checks:
+                if n_expr.operator == ast.Binary_Operator.DIVIDE:
+                    self.check_div_by_zero(n_expr.location, s_rhs)
+
+            if isinstance(n_expr.typ, ast.Builtin_Integer):
+                return smt.Binary_Int_Arithmetic_Op(
+                    smt_int_op[n_expr.operator],
+                    s_lhs,
+                    s_rhs)
+            elif isinstance(n_expr.typ, ast.Builtin_Decimal):
+                return smt.Binary_Real_Arithmetic_Op(
+                    smt_dec_op[n_expr.operator],
+                    s_lhs,
+                    s_rhs)
             else:
-                field_valid = smt.Boolean_Literal(True)
+                self.flag_unsupported(n_expr,
+                                      "arithmetic on %s" %
+                                      n_expr.typ.name)
+        else:
+            self.flag_unsupported(n_expr, "operator %s" % n_expr.operator)
+            return None
 
-        elif isinstance(prefix_typ, Record_Type):
-            # We need a sort for the record instance + a UF to convert
-            # the int values into instances of this sort.
-            if prefix_typ in self.records:
-                record_sort  = self.records[prefix_typ]
-                to_record_uf = self.uf_records[prefix_typ]
+    def build_expression_name_reference(self, n_expr):
+        assert isinstance(n_expr, ast.Name_Reference)
+
+        if isinstance(n_expr.entity, ast.Composite_Component):
+            return smt.Record_Access(record    = self.s_this,
+                                     component = n_expr.entity.name)
+        else:
+            self.flag_unsupported(n_expr,
+                                  "%s name reference" %
+                                  n_expr.__class__.__name__)
+            return None
+
+    def build_expression_equality(self, n_expr, with_checks):
+        # Build expression for equality and inequality
+        assert isinstance(n_expr, ast.Binary_Expression)
+        assert n_expr.operator in (ast.Binary_Operator.COMP_EQ,
+                                   ast.Binary_Operator.COMP_NEQ)
+        assert isinstance(with_checks, bool)
+
+        # There is a special case we need to deal with, and that is
+        # comparison to the null literal.
+        if isinstance(n_expr.n_lhs, ast.Null_Literal) and \
+           isinstance(n_expr.n_rhs, ast.Null_Literal):
+            # Special case of null == null is always true
+            # lobster-trace: LRM.Equality_On_Null
+            # lobster-trace: LRM.Null_Equivalence
+            return smt.Boolean_Literal(n_expr.operator ==
+                                       ast.Binary_Operator.COMP_EQ)
+
+        elif isinstance(n_expr.n_lhs, ast.Null_Literal) or \
+             isinstance(n_expr.n_rhs, ast.Null_Literal):
+            # This is an explicit null check against the literal. We
+            # get a term for the not-null side and then apply a null
+            # check
+            if isinstance(n_expr.n_lhs, ast.Null_Literal):
+                n_operand = n_expr.n_rhs
             else:
-                record_sort = smt.Record(prefix_typ.n_package.name +
-                                         "." + prefix_typ.name)
-                for n_component in prefix_typ.all_components():
-                    record_sort.add_component(n_component.name + ".value",
-                                              self.tr_type(n_component.n_typ))
-                    if n_component.optional:
-                        record_sort.add_component(n_component.name + ".valid",
-                                                  smt.BUILTIN_BOOLEAN)
-                self.records[prefix_typ] = record_sort
-                self.preamble.add_statement(
-                    smt.Record_Declaration(
-                        record_sort,
-                        "record %s from %s" % (
-                            prefix_typ.name,
-                            prefix_typ.location.to_string())))
-
-                to_record_uf = smt.Function(
-                    "access.%s.%s" %
-                    (prefix_typ.n_package.name, prefix_typ.name),
-                    record_sort,
-                    smt.Bound_Variable(smt.BUILTIN_INTEGER, "ref"))
-                self.preamble.add_statement(
-                    smt.Function_Declaration(to_record_uf))
-
-                self.uf_records[prefix_typ] = to_record_uf
-
-            # We can now apply the magic int to the UF to get a record
-            # value
-            dereference = smt.Function_Application(to_record_uf, prefix_value)
-
-            # We can now perform the access on the record value
-            field_value = smt.Record_Access(dereference,
-                                            n_expr.n_field.name + ".value")
-            if n_expr.n_field.optional:
-                field_valid = smt.Record_Access(dereference,
-                                                n_expr.n_field.name + ".valid")
+                n_operand = n_expr.n_lhs
+            s_operand = self.build_expression(n_operand, with_checks, True)
+            if n_expr.operator == ast.Binary_Operator.COMP_EQ:
+                return self.mk_is_null(s_operand)
             else:
-                field_valid = smt.Boolean_Literal(True)
+                return self.mk_is_not_null(s_operand)
 
         else:
-            self.mh.ice_loc(n_expr.n_prefix.location,
-                            "unexpected type %s as prefix of field access" %
-                            n_expr.n_prefix.typ.__class__.__name__)
+            # Neither side is a null literal (but either side could be
+            # a null *value*).
+            s_lhs = self.build_expression(n_expr.n_lhs, with_checks, True)
+            s_rhs = self.build_expression(n_expr.n_rhs, with_checks, True)
 
-        # pylint: disable=possibly-used-before-assignment
-        return field_value, field_valid
+            s_rv = self.mk_null_aware_equality(s_lhs, s_rhs)
+            if n_expr.operator == ast.Binary_Operator.COMP_NEQ:
+                s_rv = smt.Boolean_Negation(s_rv)
+            return s_rv
+
+    def build_expression_shortcut(self, n_expr, with_checks):
+        # Build expression for binary operators with short-cut
+        # semantics
+        assert isinstance(n_expr, ast.Binary_Expression)
+        assert n_expr.operator in (ast.Binary_Operator.LOGICAL_AND,
+                                   ast.Binary_Operator.LOGICAL_OR,
+                                   ast.Binary_Operator.LOGICAL_IMPLIES)
+        assert isinstance(with_checks, bool)
+
+        s_lhs = self.build_expression(n_expr.n_lhs, with_checks)
+
+        if with_checks:
+            gn_start = self.gn_current
+            gn = graph.Assumption(self.graph)
+            self.gn_current.add_edge_to(gn)
+            self.gn_current = gn
+
+            if n_expr.operator == ast.Binary_Operator.LOGICAL_OR:
+                gn.add_statement(smt.Assertion(smt.Boolean_Negation(s_lhs)))
+            else:
+                gn.add_statement(smt.Assertion(s_lhs))
+
+        s_rhs = self.build_expression(n_expr.n_rhs, with_checks)
+
+        if n_expr.operator == ast.Binary_Operator.LOGICAL_AND:
+            return smt.Conjunction(s_lhs, s_rhs)
+        elif n_expr.operator == ast.Binary_Operator.LOGICAL_OR:
+            return smt.Disjunction(s_lhs, s_rhs)
+        else:
+            return smt.Implication(s_lhs, s_rhs)
+
+    ######################################################################
+    # Utility
+    ######################################################################
+
+    @staticmethod
+    def mk_is_null(s_expr):
+        # Check if something is null
+        assert isinstance(s_expr, smt.Expression)
+        if isinstance(s_expr.sort, smt.Optional):
+            return smt.Optional_Null_Check(s_expr)
+        else:
+            return smt.Boolean_Literal(False)
+
+    @staticmethod
+    def mk_is_not_null(s_expr):
+        # Check if something is not null
+        assert isinstance(s_expr, smt.Expression)
+        if isinstance(s_expr.sort, smt.Optional):
+            return smt.Boolean_Negation(smt.Optional_Null_Check(s_expr))
+        else:
+            return smt.Boolean_Literal(True)
+
+    @staticmethod
+    def mk_value(s_expr):
+        # Access the value of an expression
+        assert isinstance(s_expr, smt.Expression)
+        if isinstance(s_expr.sort, smt.Optional):
+            return smt.Optional_Value(s_expr)
+        else:
+            return s_expr
+
+    @staticmethod
+    def mk_null_aware_equality(s_lhs, s_rhs):
+        # Check for equality when either side could be null
+        assert isinstance(s_lhs, smt.Expression)
+        assert isinstance(s_rhs, smt.Expression)
+        s_lhs_is_null = VCG.mk_is_null(s_lhs)
+        s_rhs_is_null = VCG.mk_is_null(s_rhs)
+
+        s_both_null = smt.Conjunction(s_lhs_is_null,
+                                      s_rhs_is_null)
+
+        return smt.Disjunction(
+            s_both_null,
+            smt.Conjunction(smt.Boolean_Negation(s_lhs_is_null),
+                            smt.Boolean_Negation(s_rhs_is_null),
+                            smt.Comparison("=",
+                                           VCG.mk_value(s_lhs),
+                                           VCG.mk_value(s_rhs))))
+
+    @staticmethod
+    def simplify_conjunction(terms):
+        # Condense a list of anded terms. The empty list generates
+        # true.
+        assert isinstance(terms, list)
+        assert all(isinstance(t, smt.Expression) and
+                   t.sort is smt.BUILTIN_BOOLEAN
+                   for t in terms)
+
+        nontrivial_terms = []
+        num_terms        = 0
+        for term in terms:
+            if term.is_static_true():
+                pass
+            elif term.is_static_false():
+                return smt.Boolean_Literal(False)
+            else:
+                nontrivial_terms.append(term)
+                num_terms += 1
+
+        if num_terms == 0:
+            return smt.Boolean_Literal(True)
+        elif num_terms == 1:
+            return nontrivial_terms[0]
+        else:
+            return smt.Conjunction(*nontrivial_terms)

@@ -1,0 +1,11 @@
+package Test3
+
+type T {
+  x optional Integer
+  y optional Integer
+}
+
+checks T {
+  x != null implies x > 10, fatal "foo"
+  x == null implies y == 10, fatal "bar"
+}

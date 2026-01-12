@@ -144,7 +144,7 @@ class Linter:
                       debug       = self.debug_vcg,
                       use_api     = self.cvc5_binary is None,
                       cvc5_binary = self.cvc5_binary)
-            vcg.analyze()
+            vcg.analyse()
 
     def verify_record_type(self, n_record_type):
         # lobster-exclude: Not safety relevant
@@ -170,7 +170,7 @@ class Linter:
                       debug       = self.debug_vcg,
                       use_api     = self.cvc5_binary is None,
                       cvc5_binary = self.cvc5_binary)
-            vcg.analyze()
+            vcg.analyse()
 
     def verify_array_type(self, n_typ):
         # lobster-exclude: Not safety relevant
